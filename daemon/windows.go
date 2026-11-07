@@ -53,7 +53,7 @@ changeLoop:
 
 	cancel()
 	changes <- svc.Status{State: svc.Stopped}
-	return
+	return false, 0
 }
 
 func runWorker(ctx context.Context, logger *slog.Logger) error {
