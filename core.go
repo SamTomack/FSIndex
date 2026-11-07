@@ -159,7 +159,7 @@ func Scan(svcCtx context.Context, logger *slog.Logger) error {
 	return nil
 }
 
-func receivePaths(inCh <-chan RawInfo, outCh chan<- FileMeta, logger *slog.Logger) {
+func receivePaths(inCh <-chan RawInfo, outCh chan<- FileMeta) {
 	for rawInfo := range inCh {
 		var name string
 		var ext string
@@ -202,7 +202,7 @@ func scan(svcCtx context.Context, logger *slog.Logger) error {
 	defer db.Close()
 
 	go getPaths(RootScanDirectory, rawInfoCh, svcCtx, logger)
-	go receivePaths(rawInfoCh, metaCh, logger)
+	go receivePaths(rawInfoCh, metaCh)
 
 	err = writeFromFilemetaChannel(db, metaCh, logger)
 	if err != nil {
