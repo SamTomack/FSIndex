@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"indexer"
+	"log/slog"
 	"time"
 
 	"golang.org/x/sys/windows"
@@ -14,38 +16,62 @@ type fsIndexService struct{}
 func (m *fsIndexService) Execute(args []string, r <-chan svc.ChangeRequest, changes chan<- svc.Status) (ssec bool, errno uint32) {
 	const cmdsAccepted = svc.AcceptStop | svc.AcceptShutdown
 	changes <- svc.Status{State: svc.StartPending}
+	ctx, cancel := context.WithCancel(context.Background())
 
-	ticker := time.NewTicker(168 * time.Hour)
-	defer ticker.Stop()
+	err := indexer.EnsurePersistentFiles()
+	if err != nil {
+		cancel()
+		return false, 1
+	}
+
+	logger, file, err := indexer.InitLogging()
+	if err != nil {
+		cancel()
+		return false, 1
+	}
+
+	defer file.Close()
+
+	go runWorker(ctx, logger)
 
 	changes <- svc.Status{State: svc.Running, Accepts: cmdsAccepted}
 
-serviceLoop:
-	for {
-		select {
-		case <-ticker.C:
-			indexer.ScanLoop()
-		case c := <-r:
-			switch c.Cmd {
-			case svc.Interrogate:
-				changes <- c.CurrentStatus
-			case svc.Stop, svc.Shutdown:
-				changes <- svc.Status{State: svc.StopPending}
-				break serviceLoop
-			default:
-				continue
-			}
+changeLoop:
+	for req := range r {
+		switch req.Cmd {
+		case svc.Interrogate:
+			changes <- req.CurrentStatus
+		case svc.Stop, svc.Shutdown:
+			changes <- svc.Status{State: svc.StopPending}
+			cancel()
+			break changeLoop
+		default:
+			logger.Error(fmt.Sprintf("Recieved unexpected control request: %d", req.Cmd))
+			continue
 		}
 	}
 
+	cancel()
 	changes <- svc.Status{State: svc.Stopped}
 	return
 }
 
-func runService() error {
-	handle := windows.CurrentProcess()
-	windows.SetPriorityClass(handle, windows.IDLE_PRIORITY_CLASS)
-	return svc.Run(indexer.ServiceName, &fsIndexService{})
+func runWorker(ctx context.Context, logger *slog.Logger) error {
+	//Scan once every 7 days, TODO: make this configurable
+	ticker := time.NewTicker(168 * time.Hour)
+	defer ticker.Stop()
+
+	logger.Info(fmt.Sprintf("%s started successfully.", indexer.ServiceName))
+
+	for {
+		select {
+		case <-ticker.C:
+			indexer.Scan(ctx, logger)
+		case <-ctx.Done():
+			fmt.Println("Worker stopping gracefully.")
+			return nil
+		}
+	}
 }
 
 func main() {
@@ -55,7 +81,9 @@ func main() {
 	}
 
 	if isService {
-		runService()
+		handle := windows.CurrentProcess()
+		windows.SetPriorityClass(handle, windows.IDLE_PRIORITY_CLASS)
+		svc.Run(indexer.ServiceName, &fsIndexService{})
 		return
 	}
 

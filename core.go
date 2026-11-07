@@ -1,12 +1,13 @@
 package indexer
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"io/fs"
 	"log/slog"
-	"path"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -14,12 +15,21 @@ import (
 
 // TODO: Should make configurable
 var RootDirPath string = "C:\\ProgramData\\FSIndex"
-var DbPath string = path.Join(RootDirPath, "index.db")
-var LogFile string = path.Join(RootDirPath, "log.txt")
-var RootScanDirectory = "C:\\Program Files"
+var DbPath string = filepath.Join(RootDirPath, "index.db")
+var LogFile string = filepath.Join(RootDirPath, "log.txt")
+var RootScanDirectory = "C:\\"
 
 const batchSize int = 5000
 const ServiceName = "FSIndex"
+
+// TODO: Should make configurable
+var skipDirs = map[string]bool{
+	"windows":                   true,
+	"$recycle.bin":              true,
+	"system volume information": true,
+	"recovery":                  true,
+	"msocache":                  true,
+}
 
 type RawInfo struct {
 	Path string
@@ -34,7 +44,7 @@ type FileMeta struct {
 	LastModified time.Time
 }
 
-func SearchFile(db *sql.DB, filePath string) (string, error) {
+func searchFile(db *sql.DB, filePath string) (string, error) {
 	var output string
 	row := db.QueryRow("SELECT file_name FROM files WHERE file_path = ?", filePath)
 	err := row.Scan(&output)
@@ -45,17 +55,21 @@ func SearchFile(db *sql.DB, filePath string) (string, error) {
 	return output, nil
 }
 
-func InitDB(logger *slog.Logger) (*sql.DB, error) {
+func initDB(logger *slog.Logger) (*sql.DB, error) {
 	db, err := sql.Open("sqlite", DbPath)
 	if err != nil {
 		logger.Error("Failed to open database " + err.Error())
 		return nil, err
 	}
 
+	db.SetMaxOpenConns(1)
+
 	//Write ahead for efficiency
 	_, err = db.Exec(`
 		PRAGMA journal_mode = WAL;
 		PRAGMA synchronous = NORMAL;
+		PRAGMA cache_size = -20000;
+		PRAGMA temp_store = MEMORY;
 		CREATE TABLE IF NOT EXISTS files (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			file_path TEXT UNIQUE,
@@ -76,7 +90,7 @@ func InitDB(logger *slog.Logger) (*sql.DB, error) {
 	return db, nil
 }
 
-func WriteFromFilemetaChannel(db *sql.DB, ch <-chan FileMeta, logger *slog.Logger) error {
+func writeFromFilemetaChannel(db *sql.DB, ch <-chan FileMeta, logger *slog.Logger) error {
 	query := `
 		INSERT INTO files (file_path, file_name, file_size, file_extension, last_modified)
 		VALUES(?, ?, ?, ?, ?)
@@ -100,7 +114,8 @@ func WriteFromFilemetaChannel(db *sql.DB, ch <-chan FileMeta, logger *slog.Logge
 			logger.Error(fmt.Sprintf("Failed to prepare transaction: %s", err.Error()))
 			return err
 		}
-		defer statement.Close()
+
+		statement.Close()
 		count := 0
 
 		for i := 0; i < batchSize; i++ {
@@ -135,21 +150,8 @@ func WriteFromFilemetaChannel(db *sql.DB, ch <-chan FileMeta, logger *slog.Logge
 	return nil
 }
 
-func ScanLoop() error {
-	err := EnsurePersistentFiles()
-	if err != nil {
-		return err
-	}
-
-	logger, file, err := InitLogging()
-	if err != nil {
-		return err
-	}
-
-	defer file.Close()
-	logger.Info("Entering scan loop.")
-
-	err = Scan(logger)
+func Scan(svcCtx context.Context, logger *slog.Logger) error {
+	err := scan(svcCtx, logger)
 	if err != nil {
 		logger.Error("Encountered an unhandled error during directory scan: " + err.Error())
 	}
@@ -157,7 +159,7 @@ func ScanLoop() error {
 	return nil
 }
 
-func ReceivePaths(inCh <-chan RawInfo, outCh chan<- FileMeta, logger *slog.Logger) {
+func receivePaths(inCh <-chan RawInfo, outCh chan<- FileMeta, logger *slog.Logger) {
 	for rawInfo := range inCh {
 		var name string
 		var ext string
@@ -187,11 +189,11 @@ func ReceivePaths(inCh <-chan RawInfo, outCh chan<- FileMeta, logger *slog.Logge
 	close(outCh)
 }
 
-func Scan(logger *slog.Logger) error {
+func scan(svcCtx context.Context, logger *slog.Logger) error {
 	rawInfoCh := make(chan RawInfo, 1000)
 	metaCh := make(chan FileMeta, 1000)
 
-	db, err := InitDB(logger)
+	db, err := initDB(logger)
 	if err != nil {
 		logger.Error("Failed to open database: " + err.Error())
 		return err
@@ -199,10 +201,10 @@ func Scan(logger *slog.Logger) error {
 
 	defer db.Close()
 
-	go GetPaths(RootScanDirectory, rawInfoCh, logger)
-	go ReceivePaths(rawInfoCh, metaCh, logger)
+	go getPaths(RootScanDirectory, rawInfoCh, svcCtx, logger)
+	go receivePaths(rawInfoCh, metaCh, logger)
 
-	err = WriteFromFilemetaChannel(db, metaCh, logger)
+	err = writeFromFilemetaChannel(db, metaCh, logger)
 	if err != nil {
 		fmt.Println("Failed to write to DB: " + err.Error())
 		return err
@@ -211,11 +213,28 @@ func Scan(logger *slog.Logger) error {
 	return nil
 }
 
-func GetPaths(root string, ch chan<- RawInfo, logger *slog.Logger) {
+func getPaths(root string, ch chan<- RawInfo, svcCtx context.Context, logger *slog.Logger) {
 	count := 0
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		//Check for cancellation on every iteration
+		select {
+		case <-svcCtx.Done():
+			return filepath.SkipAll
+		default:
+		}
+
 		if err != nil {
-			logger.Warn(fmt.Sprintf("Failed to walk %s: %s", d.Name(), err.Error()))
+			if d != nil {
+				logger.Warn(fmt.Sprintf("Failed to walk %s: %s", d.Name(), err.Error()))
+			} else {
+				logger.Warn(fmt.Sprintf("Failed to access %s: %s", path, err.Error()))
+			}
+
+			return filepath.SkipDir
+		}
+
+		if skipDirs[strings.ToLower(d.Name())] {
+			return filepath.SkipDir
 		}
 
 		info, err := d.Info()
@@ -241,7 +260,7 @@ func GetPaths(root string, ch chan<- RawInfo, logger *slog.Logger) {
 	close(ch)
 }
 
-func Debug_Get(db *sql.DB, num int, logger *slog.Logger) error {
+func debug_get(db *sql.DB, num int, logger *slog.Logger) error {
 	var output string
 
 	rows, err := db.Query(fmt.Sprintf("SELECT file_path FROM files LIMIT %d;", num))
