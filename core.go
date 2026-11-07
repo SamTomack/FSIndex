@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
-	"os"
 	"path"
 	"path/filepath"
 	"time"
@@ -13,14 +12,19 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// Should make configurable
-var RootDirPath string = "C:\\Users\\samto\\Desktop\\Code\\Indexer\\scratch"
+// TODO: Should make configurable
+var RootDirPath string = "C:\\ProgramData\\FSIndex"
 var DbPath string = path.Join(RootDirPath, "index.db")
 var LogFile string = path.Join(RootDirPath, "log.txt")
-var RootScanDirectory = "C:\\Users\\samto\\Desktop\\Code\\Indexer"
+var RootScanDirectory = "C:\\Program Files"
 
 const batchSize int = 5000
-const ServiceName = "fsindex"
+const ServiceName = "FSIndex"
+
+type RawInfo struct {
+	Path string
+	Info fs.FileInfo
+}
 
 type FileMeta struct {
 	Name         string
@@ -48,7 +52,7 @@ func InitDB(logger *slog.Logger) (*sql.DB, error) {
 		return nil, err
 	}
 
-	//Write ahead for efficiency, index on file name
+	//Write ahead for efficiency
 	_, err = db.Exec(`
 		PRAGMA journal_mode = WAL;
 		PRAGMA synchronous = NORMAL;
@@ -153,34 +157,27 @@ func ScanLoop() error {
 	return nil
 }
 
-func ReceivePaths(inCh <-chan string, outCh chan<- FileMeta, logger *slog.Logger) {
-	for path := range inCh {
-		info, err := os.Stat(path)
-
-		if err != nil {
-			logger.Error(err.Error())
-			continue
-		}
-
+func ReceivePaths(inCh <-chan RawInfo, outCh chan<- FileMeta, logger *slog.Logger) {
+	for rawInfo := range inCh {
 		var name string
 		var ext string
 		var size int64
 
-		if info.IsDir() {
+		if rawInfo.Info.IsDir() {
 			name = ""
 			ext = ""
 			size = -1
 		} else {
-			name = info.Name()
+			name = rawInfo.Info.Name()
 			ext = filepath.Ext(name)
-			size = info.Size()
+			size = rawInfo.Info.Size()
 		}
 
 		meta := FileMeta{
 			Name:         name,
-			Path:         path,
+			Path:         rawInfo.Path,
 			Extension:    ext,
-			LastModified: info.ModTime(),
+			LastModified: rawInfo.Info.ModTime(),
 			Size:         size,
 		}
 
@@ -191,8 +188,8 @@ func ReceivePaths(inCh <-chan string, outCh chan<- FileMeta, logger *slog.Logger
 }
 
 func Scan(logger *slog.Logger) error {
-	pathCh := make(chan string, 1000)
-	metaCh := make(chan FileMeta, 10000)
+	rawInfoCh := make(chan RawInfo, 1000)
+	metaCh := make(chan FileMeta, 1000)
 
 	db, err := InitDB(logger)
 	if err != nil {
@@ -202,8 +199,8 @@ func Scan(logger *slog.Logger) error {
 
 	defer db.Close()
 
-	go GetPaths(RootScanDirectory, pathCh, logger)
-	go ReceivePaths(pathCh, metaCh, logger)
+	go GetPaths(RootScanDirectory, rawInfoCh, logger)
+	go ReceivePaths(rawInfoCh, metaCh, logger)
 
 	err = WriteFromFilemetaChannel(db, metaCh, logger)
 	if err != nil {
@@ -211,23 +208,23 @@ func Scan(logger *slog.Logger) error {
 		return err
 	}
 
-	// err = Debug_Get(db, 100, logger)
-	// if err != nil {
-	// 	logger.Error(err.Error())
-	// }
-
 	return nil
 }
 
-// // Very fast so a single-threaded producer is fine
-func GetPaths(root string, ch chan<- string, logger *slog.Logger) {
+func GetPaths(root string, ch chan<- RawInfo, logger *slog.Logger) {
 	count := 0
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
-			logger.Warn("Failed to walk " + d.Name() + ": " + err.Error())
+			logger.Warn(fmt.Sprintf("Failed to walk %s: %s", d.Name(), err.Error()))
 		}
 
-		ch <- path
+		info, err := d.Info()
+		if err != nil {
+			logger.Warn("Successfully walked %s, but failed to retrieve file info: %s", d.Name(), err.Error())
+		}
+
+		ch <- RawInfo{Path: path, Info: info}
+
 		count++
 		if count%500 == 0 {
 			count = 0
@@ -238,7 +235,7 @@ func GetPaths(root string, ch chan<- string, logger *slog.Logger) {
 	})
 
 	if err != nil {
-		slog.Warn("Failed to walk " + root + ": " + err.Error())
+		slog.Warn("Failed to walk root %s,: %s", root, err.Error())
 	}
 
 	close(ch)
