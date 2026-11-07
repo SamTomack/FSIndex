@@ -87,7 +87,7 @@ func main() {
 		return
 	}
 
-	fmt.Printf("Detected launch as a standalone executable; %s is only intended to run as a Windows service", indexer.ServiceName)
+	fmt.Printf("Detected launch as a standalone executable; %s is only intended to run as a Windows service\n", indexer.ServiceName)
 	fmt.Println("Press Ctrl + C to exit, else this window will close in ten seconds.")
 	time.Sleep(10 * time.Second)
 }
