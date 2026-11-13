@@ -8,7 +8,7 @@ import (
 
 // TODO: rolling log
 func InitLogging() (*slog.Logger, *os.File, error) {
-	file, err := os.OpenFile(LogFile, os.O_WRONLY|os.O_APPEND, os.ModeAppend)
+	file, err := os.OpenFile(logFile, os.O_WRONLY|os.O_APPEND, os.ModeAppend)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -23,17 +23,17 @@ func InitLogging() (*slog.Logger, *os.File, error) {
 }
 
 func EnsurePersistentFiles() error {
-	err := InitDir(RootDirPath)
+	err := InitDir(rootDirPath)
 	if err != nil {
 		return err
 	}
 
-	err = InitFile(LogFile)
+	err = InitFile(logFile)
 	if err != nil {
 		return err
 	}
 
-	err = InitFile(DbPath)
+	err = InitFile(dbPath)
 	if err != nil {
 		return err
 	}
