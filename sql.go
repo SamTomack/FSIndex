@@ -3,69 +3,73 @@ package indexer
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"time"
 )
 
-const maxListSize = 100
+var invalidFileNameChars = regexp.MustCompile(`[<>:"/\\|?*\x00-\x1F]`)
+var invalidPathChars = regexp.MustCompile(`[<>:"|?*\x00-\x1F]`)
 
-func SearchFileNameExact(db *sql.DB, fileName string, logger *slog.Logger) ([maxListSize]FileMeta, error) {
+var IllegalFileCharErr error = errors.New("File name cannot contain any of ':', '/', '\"', '\\', '|', '*', or '?'")
+var IllegalPathCharErr error = errors.New("Path cannot contain any of ':', '|', '\"', '*', or '?'")
+
+const maxListSize = 100
+const timestampLayout = "2006-01-02 15:04:05.999999999 -0700 MST"
+
+func SearchFileNameExact(db *sql.DB, fileName string, logger *slog.Logger) ([]FileMeta, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
+	if invalidFileNameChars.MatchString(fileName) {
+		return nil, IllegalFileCharErr
+	}
+
 	rows, err := db.QueryContext(ctx, "SELECT * FROM files WHERE file_name = ?", fileName)
 	if err != nil {
-		logger.Error(fmt.Sprintf("Failed to execute SearchFileNameExact query: %s"), fileName)
-		return [maxListSize]FileMeta{}, err
+		logger.Error(fmt.Sprintf("Failed to execute SearchFileNameExact query: %s", fileName))
+		return nil, err
 	}
 
 	defer rows.Close()
-	output := [maxListSize]FileMeta{}
-	count := 0
-	for rows.Next() {
-		var temp FileMeta
-		err = rows.Scan(&temp)
-		if err != nil {
-			logger.Error("Failed to scan row as FileMeta.")
-			return [maxListSize]FileMeta{}, err
-		}
+	output, err := scanRows(rows, logger)
+	if err != nil {
+		return nil, err
+	}
 
-		output[count] = temp
-		if count == maxListSize {
-			break
-		}
+	if rows.Err() != nil {
+		logger.Error(fmt.Sprintf("Final error in rows: %s", rows.Err().Error()))
+		return nil, err
 	}
 
 	return output, nil
 }
 
-func SearchFileNameSegment(db *sql.DB, fileName string, logger *slog.Logger) ([maxListSize]FileMeta, error) {
-	// TODO: restrict queries by invalid windows file names
+func SearchFileNameSegment(db *sql.DB, fileName string, logger *slog.Logger) ([]FileMeta, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	rows, err := db.QueryContext(ctx, fmt.Sprintf("SELECT * FROM files WHERE file_name MATCH %s%", fileName))
+	if invalidPathChars.MatchString(fileName) {
+		return nil, IllegalPathCharErr
+	}
+
+	rows, err := db.QueryContext(ctx, "SELECT * FROM files WHERE file_name LIKE ?", "%"+fileName+"%")
 	if err != nil {
-		logger.Error(fmt.Sprintf("Failed to execute SearchFileNameSegment query: %s"), fileName)
-		return [maxListSize]FileMeta{}, err
+		logger.Error(fmt.Sprintf("Failed to execute SearchFileNameSegment query: %s", fileName))
+		return nil, err
 	}
 
 	defer rows.Close()
-	output := [maxListSize]FileMeta{}
-	count := 0
-	for rows.Next() {
-		var temp FileMeta
-		err = rows.Scan(&temp)
-		if err != nil {
-			logger.Error("Failed to scan row as FileMeta.")
-			return [maxListSize]FileMeta{}, err
-		}
+	output, err := scanRows(rows, logger)
+	if err != nil {
+		return nil, err
+	}
 
-		output[count] = temp
-		if count == maxListSize {
-			break
-		}
+	if rows.Err() != nil {
+		logger.Error(fmt.Sprintf("Final error in rows: %s", rows.Err().Error()))
+		return nil, err
 	}
 
 	return output, nil
@@ -104,6 +108,35 @@ func InitDB(logger *slog.Logger) (*sql.DB, error) {
 	}
 
 	return db, nil
+}
+
+func scanRows(rows *sql.Rows, logger *slog.Logger) ([]FileMeta, error) {
+	output := []FileMeta{}
+	count := 0
+
+	for rows.Next() {
+		var id int
+		var timestamp string
+		temp := FileMeta{}
+		err := rows.Scan(&id, &temp.Path, &temp.Name, &temp.Size, &temp.Extension, &timestamp)
+		if err != nil {
+			logger.Error("Failed to scan row as FileMeta.")
+			return nil, err
+		}
+
+		temp.LastModified, err = time.Parse(timestampLayout, timestamp)
+		if err != nil {
+			logger.Error(fmt.Sprintf("Failed to parse %s as time.Time", timestamp))
+		}
+
+		output = append(output, temp)
+
+		if count == maxListSize {
+			break
+		}
+	}
+
+	return output, nil
 }
 
 func writeFromFilemetaChannel(db *sql.DB, ch <-chan FileMeta, logger *slog.Logger) error {
