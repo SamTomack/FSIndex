@@ -3,7 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
-	"indexer"
+	indexer "indexer/internal"
 	"log/slog"
 	"time"
 
